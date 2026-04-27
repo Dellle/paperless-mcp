@@ -27,17 +27,61 @@ export interface DocumentMetadata {
   custom_fields?: Array<string | number>;
 }
 
+export interface PaperlessAPIOptions {
+  /**
+   * Initial Paperless API version sent in `Accept: application/json; version=<n>`.
+   * Acts as a ceiling — auto-negotiation may downgrade to what the server reports
+   * via `X-Api-Version`, but never upgrades past this value. Defaults to "10".
+   */
+  apiVersion?: string;
+}
+
+/** Minimum API version that supports `custom_field_query` and `/api/custom_fields/`. */
+export const CUSTOM_FIELD_QUERY_MIN_VERSION = 9;
+
 export class PaperlessAPI {
+  private apiVersion: string;
+
   constructor(
     private readonly baseUrl: string,
-    private readonly token: string
-  ) {}
+    private readonly token: string,
+    options: PaperlessAPIOptions = {}
+  ) {
+    this.apiVersion = options.apiVersion ?? "10";
+  }
+
+  /** Negotiated API version currently in use (may be downgraded from initial). */
+  getApiVersion(): string {
+    return this.apiVersion;
+  }
+
+  /**
+   * Throw a clear error if the negotiated API version is below the minimum required
+   * for a feature. Avoids cryptic 400/406 responses from the server.
+   */
+  requireApiVersion(min: number, feature: string): void {
+    const current = Number.parseInt(this.apiVersion, 10);
+    if (Number.isNaN(current) || current < min) {
+      throw new Error(
+        `Feature "${feature}" requires Paperless API version ${min} or higher, but the server is using version ${this.apiVersion}. Upgrade your Paperless-NGX instance or pass --api-version with a compatible value.`
+      );
+    }
+  }
 
   async request(path: string, options: RequestInit = {}): Promise<unknown> {
+    return this.#requestWithVersion(path, options, this.apiVersion, /* allowRetry */ true);
+  }
+
+  async #requestWithVersion(
+    path: string,
+    options: RequestInit,
+    version: string,
+    allowRetry: boolean
+  ): Promise<unknown> {
     const url = `${this.baseUrl}/api${path}`;
     const headers: Record<string, string> = {
       Authorization: `Token ${this.token}`,
-      Accept: "application/json; version=10",
+      Accept: `application/json; version=${version}`,
       "Content-Type": "application/json",
       "Accept-Language": "en-US,en;q=0.9",
     };
@@ -50,7 +94,26 @@ export class PaperlessAPI {
       },
     });
 
+    // Auto-negotiation: trust the server's reported max API version. Downgrade only —
+    // never upgrade past the user-configured ceiling, even if the server supports more.
+    const serverMax = response.headers.get("x-api-version");
+    if (serverMax) {
+      const serverMaxNum = Number.parseInt(serverMax, 10);
+      const currentNum = Number.parseInt(this.apiVersion, 10);
+      if (!Number.isNaN(serverMaxNum) && !Number.isNaN(currentNum) && serverMaxNum < currentNum) {
+        this.apiVersion = serverMax;
+      }
+    }
+
     if (!response.ok) {
+      // 406 Not Acceptable from DRF means the version we sent is not in ALLOWED_VERSIONS.
+      // If the server told us its max via X-Api-Version and it differs from what we sent,
+      // retry once at that version. This recovers from a stale ceiling on the very first call.
+      if (response.status === 406 && allowRetry && serverMax && serverMax !== version) {
+        this.apiVersion = serverMax;
+        return this.#requestWithVersion(path, options, serverMax, /* allowRetry */ false);
+      }
+
       let body: unknown;
       try {
         body = await response.json();
@@ -174,6 +237,9 @@ export class PaperlessAPI {
    * protection as `searchDocuments`. Removing this stripping is a breaking change.
    */
   async filterDocuments(params: Record<string, unknown>): Promise<unknown> {
+    if (params.custom_field_query !== undefined) {
+      this.requireApiVersion(CUSTOM_FIELD_QUERY_MIN_VERSION, "custom_field_query");
+    }
     const search = new URLSearchParams();
     for (const [key, value] of Object.entries(params)) {
       if (value === undefined || value === null) continue;
@@ -212,6 +278,7 @@ export class PaperlessAPI {
   }
 
   async getCustomFields(): Promise<unknown> {
+    this.requireApiVersion(CUSTOM_FIELD_QUERY_MIN_VERSION, "list_custom_fields");
     return this.request("/custom_fields/");
   }
 

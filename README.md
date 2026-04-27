@@ -471,3 +471,23 @@ npm run start -- <baseUrl> <token> --http --port 3000
 - The MCP API will be available at `POST /mcp` on the specified port.
 - Each request is handled statelessly, following the [StreamableHTTPServerTransport](https://github.com/modelcontextprotocol/typescript-sdk) pattern.
 - GET and DELETE requests to `/mcp` will return 405 Method Not Allowed.
+
+## API Version Compatibility
+
+Paperless-NGX uses Accept-header API versioning (`Accept: application/json; version=<n>`). This MCP server defaults to **version 10**, which is what current Paperless-NGX servers support and what `filter_documents.custom_field_query` / `list_custom_fields` require (minimum version 9).
+
+For older Paperless-NGX instances:
+
+- The client **auto-negotiates downward**: every response includes an `X-Api-Version` header reporting the server's max supported version. If it's lower than the configured ceiling, subsequent requests are sent with that lower version automatically.
+- If the very first request returns `406 Not Acceptable` (because the server doesn't accept the configured version at all), the client retries once at the version reported in `X-Api-Version`.
+- The configured version is a **ceiling** — auto-negotiation only ever downgrades; it never upgrades past what you set.
+
+You can override the default via:
+
+```bash
+paperless-mcp <baseUrl> <token> --api-version 9
+# or, in --http mode:
+PAPERLESS_API_VERSION=9 paperless-mcp <baseUrl> <token> --http
+```
+
+If your Paperless server is too old to support `custom_field_query` (i.e. negotiated version < 9), `filter_documents` (with `custom_field_query`) and `list_custom_fields` will return a clear error message — all other tools work normally.

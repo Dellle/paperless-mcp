@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { PaperlessAPI } from "../src/api/PaperlessAPI";
 import { type FetchHarness, parseJson, setupHarness, TEST_TOKEN } from "./helpers/harness";
 
 describe("MCP server registration", () => {
@@ -428,5 +429,150 @@ describe("custom fields tool", () => {
     expect(h.calls[0]?.url).toBe("https://paperless.test/api/custom_fields/");
     const body = parseJson(result as never) as { results: Array<Record<string, unknown>> };
     expect(body.results[0]?.name).toBe("Invoice Total");
+  });
+});
+
+describe("API version negotiation", () => {
+  let h: FetchHarness;
+  beforeEach(async () => {
+    h = await setupHarness();
+  });
+  afterEach(async () => {
+    await h.cleanup();
+  });
+
+  it("downgrades subsequent requests when server reports a lower X-Api-Version", async () => {
+    h.setNextResponse(
+      { count: 0, results: [] },
+      { headers: { "content-type": "application/json", "x-api-version": "7" } }
+    );
+    h.setNextResponse({ count: 0, results: [] });
+
+    await h.client.callTool({ name: "list_tags", arguments: {} });
+    await h.client.callTool({ name: "list_correspondents", arguments: {} });
+
+    const firstHeaders = h.calls[0]?.init.headers as Record<string, string>;
+    const secondHeaders = h.calls[1]?.init.headers as Record<string, string>;
+    expect(firstHeaders.Accept).toBe("application/json; version=10");
+    expect(secondHeaders.Accept).toBe("application/json; version=7");
+  });
+
+  it("never upgrades past the configured ceiling", async () => {
+    h.setNextResponse(
+      { count: 0, results: [] },
+      { headers: { "content-type": "application/json", "x-api-version": "20" } }
+    );
+    h.setNextResponse({ count: 0, results: [] });
+
+    await h.client.callTool({ name: "list_tags", arguments: {} });
+    await h.client.callTool({ name: "list_correspondents", arguments: {} });
+
+    const secondHeaders = h.calls[1]?.init.headers as Record<string, string>;
+    expect(secondHeaders.Accept).toBe("application/json; version=10");
+  });
+
+  it("retries once on 406 using server's reported X-Api-Version", async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      const url = typeof input === "string" ? input : input.toString();
+      calls.push({ url, init });
+      if (calls.length === 1) {
+        return new Response(JSON.stringify({ detail: "Not acceptable" }), {
+          status: 406,
+          headers: { "content-type": "application/json", "x-api-version": "5" },
+        });
+      }
+      return new Response(JSON.stringify({ id: 1, name: "ok" }), {
+        status: 200,
+        headers: { "content-type": "application/json", "x-api-version": "5" },
+      });
+    }) as typeof fetch;
+
+    try {
+      const api = new PaperlessAPI("https://paperless.test", "tok");
+      const result = await api.request("/tags/");
+      expect(result).toEqual({ id: 1, name: "ok" });
+      expect(calls).toHaveLength(2);
+      expect((calls[0]?.init.headers as Record<string, string>).Accept).toBe(
+        "application/json; version=10"
+      );
+      expect((calls[1]?.init.headers as Record<string, string>).Accept).toBe(
+        "application/json; version=5"
+      );
+      expect(api.getApiVersion()).toBe("5");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("respects apiVersion option as initial ceiling", async () => {
+    const originalFetch = globalThis.fetch;
+    let captured: Record<string, string> = {};
+    globalThis.fetch = (async (_input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      captured = init.headers as Record<string, string>;
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    try {
+      const api = new PaperlessAPI("https://paperless.test", "tok", { apiVersion: "5" });
+      await api.request("/tags/");
+      expect(captured.Accept).toBe("application/json; version=5");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("throws a clear error when custom_field_query is used on too-old API version", async () => {
+    h.setNextResponse(
+      { count: 0, results: [] },
+      { headers: { "content-type": "application/json", "x-api-version": "7" } }
+    );
+    await h.client.callTool({ name: "list_tags", arguments: {} });
+
+    const result = (await h.client.callTool({
+      name: "filter_documents",
+      arguments: { custom_field_query: ["foo", "exact", "bar"] },
+    })) as { isError?: boolean; content: Array<{ type: string; text: string }> };
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toMatch(/custom_field_query.*requires.*version 9/i);
+  });
+
+  it("throws a clear error when list_custom_fields is used on too-old API version", async () => {
+    h.setNextResponse(
+      { count: 0, results: [] },
+      { headers: { "content-type": "application/json", "x-api-version": "7" } }
+    );
+    await h.client.callTool({ name: "list_tags", arguments: {} });
+
+    const result = (await h.client.callTool({
+      name: "list_custom_fields",
+      arguments: {},
+    })) as { isError?: boolean; content: Array<{ type: string; text: string }> };
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toMatch(/list_custom_fields.*requires.*version 9/i);
+  });
+
+  it("filter_documents WITHOUT custom_field_query works on older API versions", async () => {
+    h.setNextResponse(
+      { count: 0, results: [] },
+      { headers: { "content-type": "application/json", "x-api-version": "5" } }
+    );
+    await h.client.callTool({ name: "list_tags", arguments: {} });
+
+    h.setNextResponse({ count: 0, results: [] });
+    const result = (await h.client.callTool({
+      name: "filter_documents",
+      arguments: { tags__id__all: [1, 2] },
+    })) as { isError?: boolean };
+
+    expect(result.isError).toBeFalsy();
+    const url = new URL(h.calls[1]?.url as string);
+    expect(url.searchParams.get("tags__id__all")).toBe("1,2");
   });
 });

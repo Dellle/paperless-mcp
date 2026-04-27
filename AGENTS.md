@@ -77,7 +77,7 @@ async (args) => {
 
 Returning raw API JSON (without `content`) breaks the MCP protocol — clients with strict validation will reject it. The `asTextResult` helper JSON-stringifies non-string values automatically.
 
-**Paperless API versioning**: all requests include `Accept: application/json; version=5`. Auth uses the `Token <token>` scheme.
+**Paperless API versioning**: all requests include `Accept: application/json; version=<n>`, default `n=10`. Auth uses the `Token <token>` scheme. The version is a **ceiling** — `PaperlessAPI` reads `X-Api-Version` from every response and auto-downgrades subsequent requests if the server reports a lower max. On a `406 Not Acceptable` first response, it retries once using the server-reported version. Override the default with `--api-version <n>` (stdio) or `PAPERLESS_API_VERSION` env var (HTTP mode). Features that need a minimum version (`custom_field_query`, `/api/custom_fields/`) call `api.requireApiVersion(min, feature)` and emit a clear error instead of letting the server return a cryptic 400/406.
 
 **Bulk operations**: document bulk edits use `(documents[], method, parameters)` pattern via `/api/documents/bulk_edit/`; object bulk edits (tags, correspondents, document types) use `bulkEditObjects(ids[], objectType, operation, parameters)` via `/api/bulk_edit_objects/`.
 
