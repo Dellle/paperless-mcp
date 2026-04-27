@@ -6,7 +6,8 @@ MCP (Model Context Protocol) server that exposes Paperless-NGX document manageme
 
 ```
 src/
-  index.ts              # Entry point: CLI parsing, transport setup (stdio or HTTP/SSE)
+  index.ts              # Entry point: CLI parsing, transport selection (stdio or HTTP)
+  http.ts               # createHttpApp(server) — express app for HTTP/SSE transport (testable)
   server.ts             # createServer(api) — wires PaperlessAPI to all tool domains
   api/
     PaperlessAPI.ts     # HTTP client wrapping the Paperless-NGX REST API (version 5)
@@ -17,8 +18,16 @@ src/
     correspondents.ts   # Correspondent CRUD and bulk operations
     documentTypes.ts    # Document type CRUD and bulk operations
 tests/
-  helpers/harness.ts    # Reusable test harness: in-memory MCP client/server + fetch mock
-  server.test.ts        # MCP integration tests (one block per tool domain)
+  helpers/harness.ts    # Reusable test harness: in-memory MCP client/server + routed fetch mock
+  fixtures/paperless.ts # Realistic Paperless response shapes (DOCUMENT, TAG, paginated, …)
+  server.test.ts        # Tool registration + auth header smoke tests
+  documents.test.ts     # Document tools (one file per domain, matches src/tools/)
+  tags.test.ts
+  correspondents.test.ts
+  documentTypes.test.ts
+  filterDocuments.test.ts  # filter_documents + list_custom_fields
+  apiVersion.test.ts    # Accept-header version negotiation + downgrade
+  http.test.ts          # HTTP transport smoke test (real express listener)
 ```
 
 **Adding a new tool domain**: create `src/tools/<domain>.ts` exporting `register<Domain>Tools(server: McpServer, api: PaperlessAPI)`, then call it inside `createServer()` in `src/server.ts`. Do NOT wire it directly in `src/index.ts` — `index.ts` only handles transport setup.
@@ -95,6 +104,7 @@ Tests live in `tests/` and use Vitest. **The harness in `tests/helpers/harness.t
 
 ```ts
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { DOCUMENT, EMPTY_PAGE, OK, PATH } from "./fixtures/paperless";
 import { type FetchHarness, parseJson, setupHarness } from "./helpers/harness";
 
 describe("my new tool", () => {
@@ -103,24 +113,61 @@ describe("my new tool", () => {
   afterEach(async () => { await h.cleanup(); });
 
   it("hits the right endpoint", async () => {
-    h.setNextResponse({ id: 1 });                        // queue mock fetch response
-    const result = await h.client.callTool({             // call through the real MCP client
-      name: "my_tool",
-      arguments: { foo: "bar" },
+    h.onGet(PATH.documentById as RegExp).reply({ ...DOCUMENT, id: 1 });
+
+    const result = await h.client.callTool({
+      name: "get_document",
+      arguments: { id: 1 },
     });
-    expect(h.calls[0]?.url).toBe("https://paperless.test/api/...");
-    expect(parseJson(result as never)).toEqual({ id: 1 });
+
+    h.expectCalled("GET", "/api/documents/1/");
+    expect((parseJson(result as never) as { id: number }).id).toBe(1);
   });
 });
 ```
 
 ### Harness API (`tests/helpers/harness.ts`)
 
-- `setupHarness()` → `{ api, client, calls, setNextResponse, setNextRawResponse, cleanup }`
-- `calls: FetchCall[]` — every fetch made by the API client is recorded as `{ url, init }`
-- `setNextResponse(body, init?)` — queue a JSON response for the next fetch (auto-stringifies)
-- `setNextRawResponse(response)` — queue a raw `Response` (use for non-JSON, error statuses, custom headers)
-- `getText(result)` / `parseJson(result)` — extract the text payload from a `CallToolResult`
+The harness is **routing-first** and order-independent. Mocks are matched by HTTP method + URL pathname, so adding/reordering API calls in the code under test does not break tests.
+
+**Routing API (preferred):**
+
+- `h.onGet(matcher)` / `h.onPost(matcher)` / `h.onPut(matcher)` / `h.onPatch(matcher)` / `h.onDelete(matcher)` — register a route. `matcher` is a string (exact pathname match) or a RegExp (tested against pathname).
+- Returns a `RouteHandle` with chainable methods:
+  - `.reply(body, init?)` — queue a JSON response (auto-stringifies, default status 200, fills `content-type`).
+  - `.replyError(status, body?)` — queue an HTTP error response.
+  - `.replyRaw(response)` — queue a raw `Response` (full control over status, headers, body).
+  - `.replyDefault(body, init?)` — set a fallback reply used when the queued replies for this route are exhausted (great for "always reply OK to /tags/").
+
+**Server-side helpers:**
+
+- `h.setServerApiVersion(n)` — set the `x-api-version` response header globally to exercise the `PaperlessAPI` auto-downgrade path. Pass `null` to clear.
+
+**Assertion helpers:**
+
+- `h.lastCall()` — most recent `FetchCall` (`{ url, init, parsedUrl, method }`).
+- `h.callsTo(matcher)` — all calls whose pathname matches.
+- `h.requestBody(n?)` — JSON-parsed body of the Nth call (defaults to last).
+- `h.requestHeader(name, n?)` — case-insensitive header lookup on the Nth call.
+- `h.expectCalled(method, matcher)` — assert + return the matching call.
+- `expectMcpError(result, /pattern/?)` — assert a tool result has `isError: true` and (optionally) matches a pattern.
+- `getText(result)` / `parseJson(result)` — extract the text payload from a `CallToolResult`.
+
+**Legacy FIFO API (still works as a fallback when no route matches):**
+
+- `h.setNextResponse(body, init?)`, `h.setNextRawResponse(response)`, `h.setNextError(status, body?)`, `h.setNextNetworkError(message?)`.
+- `h.calls: FetchCall[]` — every fetch is recorded in order regardless of which API queued the response.
+
+**Fixtures (`tests/fixtures/paperless.ts`):**
+
+- `DOCUMENT`, `TAG`, `CORRESPONDENT`, `DOCUMENT_TYPE`, `CUSTOM_FIELD` — realistic Paperless-NGX object shapes.
+- `paginated(results)` — wraps results into the standard `{ count, next, previous, all, results }` envelope.
+- `EMPTY_PAGE`, `OK` — common reply shorthands.
+- `PATH` — common path matchers (e.g. `PATH.documentById` is `/^\/api\/documents\/\d+\/$/`).
+
+### HTTP transport tests
+
+`src/http.ts` exports `createHttpApp(server)` which is independently testable. `tests/http.test.ts` starts a real express listener on an ephemeral port and exercises the `/mcp` endpoint end-to-end. When refactoring CLI/transport plumbing in `src/index.ts`, prefer keeping the express setup in `src/http.ts` to preserve testability.
 
 ### What to test (and what not to)
 

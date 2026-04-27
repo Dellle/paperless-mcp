@@ -1,9 +1,7 @@
 #!/usr/bin/env node
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import express from "express";
 import { PaperlessAPI } from "./api/PaperlessAPI";
+import { createHttpApp } from "./http";
 import { createServer } from "./server";
 
 const args = process.argv.slice(2);
@@ -60,97 +58,7 @@ async function main() {
   const server = createServer(api);
 
   if (useHttp) {
-    const app = express();
-    app.use(express.json());
-
-    const sseTransports: Record<string, SSEServerTransport> = {};
-
-    app.post("/mcp", async (req, res) => {
-      try {
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: undefined,
-        });
-        res.on("close", () => {
-          transport.close();
-        });
-        await server.connect(transport);
-        await transport.handleRequest(req, res, req.body);
-      } catch (error) {
-        console.error("Error handling MCP request:", error);
-        if (!res.headersSent) {
-          res.status(500).json({
-            jsonrpc: "2.0",
-            error: {
-              code: -32603,
-              message: "Internal server error",
-            },
-            id: null,
-          });
-        }
-      }
-    });
-
-    app.get("/mcp", async (_req, res) => {
-      res.writeHead(405).end(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          error: {
-            code: -32000,
-            message: "Method not allowed.",
-          },
-          id: null,
-        })
-      );
-    });
-
-    app.delete("/mcp", async (_req, res) => {
-      res.writeHead(405).end(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          error: {
-            code: -32000,
-            message: "Method not allowed.",
-          },
-          id: null,
-        })
-      );
-    });
-
-    app.get("/sse", async (_req, res) => {
-      console.log("SSE request received");
-      try {
-        const transport = new SSEServerTransport("/messages", res);
-        sseTransports[transport.sessionId] = transport;
-        res.on("close", () => {
-          delete sseTransports[transport.sessionId];
-          transport.close();
-        });
-        await server.connect(transport);
-      } catch (error) {
-        console.error("Error handling SSE request:", error);
-        if (!res.headersSent) {
-          res.status(500).json({
-            jsonrpc: "2.0",
-            error: {
-              code: -32603,
-              message: "Internal server error",
-            },
-            id: null,
-          });
-        }
-      }
-    });
-
-    app.post("/messages", async (req, res) => {
-      const sessionId = req.query.sessionId as string;
-      const transport = sseTransports[sessionId];
-      if (transport) {
-        await transport.handlePostMessage(req, res, req.body);
-      } else {
-        res.status(400).send("No transport found for sessionId");
-      }
-    });
-
+    const app = createHttpApp(server);
     app.listen(port, () => {
       console.log(`MCP Stateless Streamable HTTP Server listening on port ${port}`);
     });
