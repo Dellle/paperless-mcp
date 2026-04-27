@@ -1,5 +1,22 @@
 import type { PathMatcher } from "../helpers/harness";
 
+/**
+ * Fixture shapes mirror the actual Paperless-NGX REST API serializer output
+ * (see `src/documents/serialisers.py` in the upstream repo). Fields are
+ * production-accurate as of paperless-ngx main branch (2024+, API v10).
+ *
+ * Notes on what is and isn't real:
+ *  - `download_url` and `thumbnail_url` are NOT serializer fields. They are
+ *    intentionally omitted here. `searchDocuments` / `filterDocuments` strip
+ *    them defensively, so tests that exercise that strip must inject those
+ *    fields explicitly (see `tests/documents.test.ts`).
+ *  - `created` is a date (`YYYY-MM-DD`), not a datetime; `modified` and `added`
+ *    are datetimes with timezone.
+ *  - The pagination envelope's `all: number[]` field is a Paperless-NGX
+ *    extension to standard DRF pagination, present on API v9 and below; it is
+ *    removed in v10+. The `paginated()` helper still emits it for back-compat.
+ */
+
 export const TAG: Record<string, unknown> = {
   id: 3,
   slug: "invoice",
@@ -11,6 +28,8 @@ export const TAG: Record<string, unknown> = {
   is_insensitive: true,
   is_inbox_tag: false,
   document_count: 12,
+  parent: null,
+  children: [],
   owner: 1,
   user_can_change: true,
 };
@@ -23,7 +42,7 @@ export const CORRESPONDENT: Record<string, unknown> = {
   matching_algorithm: 6,
   is_insensitive: true,
   document_count: 5,
-  last_correspondence: "2024-09-01T00:00:00Z",
+  last_correspondence: "2024-09-01",
   owner: 1,
   user_can_change: true,
 };
@@ -44,7 +63,8 @@ export const CUSTOM_FIELD: Record<string, unknown> = {
   id: 1,
   name: "Invoice Total",
   data_type: "monetary",
-  extra_data: {},
+  extra_data: { default_currency: null },
+  document_count: 0,
 };
 
 export const DOCUMENT: Record<string, unknown> = {
@@ -55,21 +75,24 @@ export const DOCUMENT: Record<string, unknown> = {
   title: "Receipt",
   content: "OCR text body",
   tags: [3],
-  created: "2024-01-15T00:00:00Z",
+  created: "2024-01-15",
   created_date: "2024-01-15",
   modified: "2024-01-15T00:00:00Z",
   added: "2024-01-15T12:00:00Z",
+  deleted_at: null,
   archive_serial_number: null,
   original_file_name: "receipt.pdf",
   archived_file_name: "2024-01-15 Receipt.pdf",
+  page_count: 1,
+  mime_type: "application/pdf",
+  root_document: null,
+  versions: [],
+  duplicate_documents: [],
+  notes: [],
+  custom_fields: [],
   owner: 1,
   user_can_change: true,
   is_shared_by_requester: false,
-  notes: [],
-  custom_fields: [],
-  page_count: 1,
-  download_url: "https://paperless.test/api/documents/42/download/",
-  thumbnail_url: "https://paperless.test/api/documents/42/thumb/",
 };
 
 export function paginated<T>(

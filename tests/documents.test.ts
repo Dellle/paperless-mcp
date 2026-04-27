@@ -24,7 +24,16 @@ describe("documents tools", () => {
 
   it("search_documents strips content/download_url/thumbnail_url to protect token budget", async () => {
     h.onGet(PATH.documents as string).reply(
-      paginated([{ ...DOCUMENT, id: 1, title: "Invoice", content: "x".repeat(10_000) }])
+      paginated([
+        {
+          ...DOCUMENT,
+          id: 1,
+          title: "Invoice",
+          content: "x".repeat(10_000),
+          download_url: "https://paperless.test/api/documents/1/download/",
+          thumbnail_url: "https://paperless.test/api/documents/1/thumb/",
+        },
+      ])
     );
 
     const result = await h.client.callTool({

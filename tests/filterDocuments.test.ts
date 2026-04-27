@@ -84,7 +84,16 @@ describe("filter_documents tool", () => {
 
   it("strips content/download_url/thumbnail_url from results", async () => {
     h.onGet(PATH.documents as string).reply(
-      paginated([{ ...DOCUMENT, id: 9, title: "Receipt", content: "long".repeat(500) }])
+      paginated([
+        {
+          ...DOCUMENT,
+          id: 9,
+          title: "Receipt",
+          content: "long".repeat(500),
+          download_url: "https://paperless.test/api/documents/9/download/",
+          thumbnail_url: "https://paperless.test/api/documents/9/thumb/",
+        },
+      ])
     );
 
     const result = await h.client.callTool({
