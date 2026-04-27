@@ -1,14 +1,19 @@
 {
-  "name": "@nloui/paperless-mcp",
-  "version": "1.0.0",
+  "name": "@dellle/paperless-mcp",
+  "version": "1.1.0",
   "description": "Model Context Protocol (MCP) server for interacting with Paperless-NGX document management system. Enables AI assistants to manage documents, tags, correspondents, and document types through the Paperless-NGX API.",
-  "main": "src/index.js",
+  "main": "build/index.js",
   "bin": {
-    "paperless-mcp": "src/index.js"
+    "paperless-mcp": "build/index.js"
   },
+  "files": [
+    "build",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "ts-node src/index.ts",
-    "build": "tsc",
+    "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "lint": "biome check src tests",
     "lint:fix": "biome check --write src tests",
@@ -16,7 +21,11 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "inspect": "npm run build && npx -y @modelcontextprotocol/inspector node build/index.js"
+    "inspect": "npm run build && npx -y @modelcontextprotocol/inspector node build/index.js",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run build"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "keywords": [
     "mcp",
@@ -28,10 +37,13 @@
     "paperless"
   ],
   "author": "Nick Loui",
+  "contributors": [
+    "Sebastian Dellwig"
+  ],
   "license": "ISC",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nloui/paperless-mcp.git"
+    "url": "git+https://github.com/Dellle/paperless-mcp.git"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.11.1",
