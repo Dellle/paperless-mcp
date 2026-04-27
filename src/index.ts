@@ -1,22 +1,17 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import { PaperlessAPI } from "./api/PaperlessAPI";
-import { registerCorrespondentTools } from "./tools/correspondents";
-import { registerDocumentTools } from "./tools/documents";
-import { registerDocumentTypeTools } from "./tools/documentTypes";
-import { registerTagTools } from "./tools/tags";
+import { createServer } from "./server";
 
-// Simple CLI argument parsing
 const args = process.argv.slice(2);
 const useHttp = args.includes("--http");
 let port = 3000;
 const portIndex = args.indexOf("--port");
 if (portIndex !== -1 && args[portIndex + 1]) {
-  const parsed = parseInt(args[portIndex + 1], 10);
-  if (!isNaN(parsed)) port = parsed;
+  const parsed = parseInt(args[portIndex + 1] as string, 10);
+  if (!Number.isNaN(parsed)) port = parsed;
 }
 
 async function main() {
@@ -36,9 +31,7 @@ async function main() {
     baseUrl = args[0];
     token = args[1];
     if (!baseUrl || !token) {
-      console.error(
-        "Usage: paperless-mcp <baseUrl> <token> [--http] [--port <port>]"
-      );
+      console.error("Usage: paperless-mcp <baseUrl> <token> [--http] [--port <port>]");
       console.error(
         "Example: paperless-mcp http://localhost:8000 your-api-token --http --port 3000"
       );
@@ -49,19 +42,13 @@ async function main() {
     }
   }
 
-  // Initialize API client and server once
   const api = new PaperlessAPI(baseUrl, token);
-  const server = new McpServer({ name: "paperless-ngx", version: "1.0.0" });
-  registerDocumentTools(server, api);
-  registerTagTools(server, api);
-  registerCorrespondentTools(server, api);
-  registerDocumentTypeTools(server, api);
+  const server = createServer(api);
 
   if (useHttp) {
     const app = express();
     app.use(express.json());
 
-    // Store transports for each session
     const sseTransports: Record<string, SSEServerTransport> = {};
 
     app.post("/mcp", async (req, res) => {
@@ -89,7 +76,7 @@ async function main() {
       }
     });
 
-    app.get("/mcp", async (req, res) => {
+    app.get("/mcp", async (_req, res) => {
       res.writeHead(405).end(
         JSON.stringify({
           jsonrpc: "2.0",
@@ -102,7 +89,7 @@ async function main() {
       );
     });
 
-    app.delete("/mcp", async (req, res) => {
+    app.delete("/mcp", async (_req, res) => {
       res.writeHead(405).end(
         JSON.stringify({
           jsonrpc: "2.0",
@@ -115,7 +102,7 @@ async function main() {
       );
     });
 
-    app.get("/sse", async (req, res) => {
+    app.get("/sse", async (_req, res) => {
       console.log("SSE request received");
       try {
         const transport = new SSEServerTransport("/messages", res);
@@ -151,9 +138,7 @@ async function main() {
     });
 
     app.listen(port, () => {
-      console.log(
-        `MCP Stateless Streamable HTTP Server listening on port ${port}`
-      );
+      console.log(`MCP Stateless Streamable HTTP Server listening on port ${port}`);
     });
   } else {
     const transport = new StdioServerTransport();
