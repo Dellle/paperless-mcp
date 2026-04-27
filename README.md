@@ -90,15 +90,139 @@ get_document({
 ```
 
 #### search_documents
-Full-text search across documents.
+Full-text search across documents using the Paperless-NGX query DSL (Tantivy-based).
+
+Returns metadata WITHOUT the OCR `content` field to protect token budgets — call `get_document` for full content.
+
+Use `search_documents` for free-text queries; use `filter_documents` for typed/structured predicates (numeric custom fields, "must have ALL tags", "no correspondent", etc.).
 
 Parameters:
-- query: Search query string
+- query: Paperless-NGX DSL string (see syntax below)
+- page (optional)
+- page_size (optional)
+
+Query DSL — all combinable, default operator is AND:
+
+| Field | Example | Notes |
+|---|---|---|
+| `title:` / `content:` | `title:invoice` | Search title or OCR content |
+| `type:` | `type:invoice` | Match document type by name |
+| `correspondent:` | `correspondent:bank` | Match correspondent by name |
+| `tag:` | `tag:unpaid` | Repeat for multiple tags |
+| `asn:` | `asn:1234` | Archive serial number |
+| `custom_fields.value:` | `custom_fields.value:1312` | Match any custom field value |
+| `custom_fields.name:` | `custom_fields.name:"Contract Number"` | Quote multi-word names |
+| `notes.user:` / `notes.note:` | `notes.user:alice` | Note author or content |
+| `created:` / `added:` / `modified:` | `created:[2020 to 2024]` | Inclusive range |
+| Date keywords | `added:yesterday`, `modified:"this year"` | `today`, `yesterday`, `"previous week"`, `"this month"`, `"previous month"`, `"this year"`, `"previous year"`, `"previous quarter"` |
+| Booleans | `invoice AND unpaid`, `(a OR b) NOT c` | Case-sensitive operators |
+| Wildcards | `prod*name` | `*` = zero or more chars |
+| Exact phrase | `"Contract Number"` | Quoted |
+
+Notes: matching is accent-insensitive (`resume` finds `résumé`) and separator-agnostic (`1312` finds `A-1312/B`). Custom date fields do **not** support relative date keywords — use `filter_documents.custom_field_query` with `range`/`gt`/`lt` instead.
 
 ```typescript
 search_documents({
-  query: "invoice 2024"
+  query: 'type:invoice tag:unpaid created:[2024 to 2024]'
 })
+
+search_documents({
+  query: 'correspondent:bank custom_fields.name:"Contract Number" custom_fields.value:1312'
+})
+```
+
+#### filter_documents
+Structured filtering of documents — use this when the DSL of `search_documents` is insufficient.
+
+When to prefer `filter_documents`:
+- Typed comparisons on custom fields: `amount > 100`, date in range, boolean true/false, `is null`, `exists`.
+- Strict tag-set requirements: documents that have **ALL** of tags `[1,2,3]`.
+- Negative filters: no correspondent, not in inbox, no tags assigned.
+- Structural facets: by owner, mime_type, original_filename, archive_serial_number, has_custom_fields.
+- Date-bounded queries on standard fields with precise ISO dates.
+
+Parameters (all optional, all combined with AND):
+
+| Param | Type | Description |
+|---|---|---|
+| `query` | string | Optional full-text DSL — combined with structured filters |
+| `correspondent__id__in` | number[] | Match any of these correspondent IDs |
+| `correspondent__isnull` | boolean | True = no correspondent |
+| `document_type__id__in` | number[] | Match any of these document type IDs |
+| `document_type__isnull` | boolean | True = no document type |
+| `storage_path__id__in` | number[] | Match any of these storage path IDs |
+| `tags__id__all` | number[] | Must have **all** these tag IDs |
+| `tags__id__in` | number[] | Has **any** of these tag IDs |
+| `tags__id__none` | number[] | Has **none** of these tag IDs |
+| `is_tagged` | boolean | Has at least one tag |
+| `is_in_inbox` | boolean | Currently in inbox |
+| `owner__id__in` | number[] | Owned by any of these user IDs |
+| `owner__isnull` | boolean | No owner |
+| `title__icontains` | string | Case-insensitive substring |
+| `content__icontains` | string | Case-insensitive substring on OCR content |
+| `original_filename__icontains` | string | |
+| `archive_serial_number` | string | Exact match |
+| `mime_type` | string | e.g. `application/pdf` |
+| `created__gte` / `created__lte` | string | ISO date or datetime |
+| `added__gte` / `added__lte` | string | |
+| `modified__gte` / `modified__lte` | string | |
+| `has_custom_fields` | boolean | |
+| `custom_fields__id__all` | number[] | Must have all these custom fields **assigned** (existence, not value) |
+| `custom_field_query` | JSON tree | Typed predicates on custom field **values** — see below |
+| `ordering` | string | e.g. `-created`, `title` |
+| `page`, `page_size` | number | |
+
+`custom_field_query` is a recursive JSON tree (max depth 10, max 20 atoms total):
+
+```
+Atom:    [fieldRef, operator, value]    where fieldRef = custom field id (number) or name (string)
+AND/OR:  ["AND", [subq, ...]]   |   ["OR", [subq, ...]]
+NOT:     ["NOT", subquery]
+```
+
+Operators by `data_type` (call `list_custom_fields` to discover field types):
+
+| data_type | operators |
+|---|---|
+| string / url / longtext | exact, in, isnull, exists, icontains, istartswith, iendswith |
+| integer / float | exact, in, isnull, exists, gt, gte, lt, lte, range |
+| date | exact, in, isnull, exists, gt, gte, lt, lte, range, year__exact, month__exact, day__exact |
+| monetary | numeric ops + icontains/istartswith/iendswith (currency stripped for compare) |
+| boolean | exact, in, isnull, exists |
+| select | exact, in, isnull, exists (value is option id or label) |
+| documentlink | exact, in, isnull, exists, contains (subset check on linked document ids) |
+
+```typescript
+// All unpaid invoices from a specific correspondent, must have BOTH "urgent" and "review" tags
+filter_documents({
+  correspondent__id__in: [3],
+  document_type__id__in: [7],
+  tags__id__all: [12, 19],
+  is_in_inbox: true,
+})
+
+// Custom field value predicate: Invoice Total > 100 AND status = pending
+filter_documents({
+  custom_field_query: ["AND", [
+    ["Invoice Total", "gt", 100],
+    ["status", "exact", "pending"]
+  ]]
+})
+
+// Combined full-text + structured
+filter_documents({
+  query: "tax",
+  created__gte: "2024-01-01",
+  has_custom_fields: true,
+  ordering: "-created"
+})
+```
+
+#### list_custom_fields
+List all custom fields defined in this Paperless instance. **Call this before building a `custom_field_query`** — it returns each field's `id`, `name`, `data_type`, and `extra_data` (e.g. select options).
+
+```typescript
+list_custom_fields()
 ```
 
 #### download_document

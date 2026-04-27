@@ -226,12 +226,57 @@ export function registerDocumentTools(server: McpServer, api: PaperlessAPI) {
 
   server.tool(
     "search_documents",
-    "Search through documents using full-text search across content, titles, tags, and metadata. Returns document metadata WITHOUT the full OCR content field to prevent token overflow. Use get_document to retrieve full details for specific documents of interest. Supports Paperless-NGX advanced query syntax.",
+    [
+      "Full-text search across documents using Paperless-NGX's query DSL (Tantivy-based).",
+      "Returns document metadata WITHOUT the full OCR `content` field to prevent token overflow — call get_document for full content.",
+      "",
+      "WHEN TO USE: free-text search ('find anything mentioning bitcoin'), or quick filters expressible as DSL terms.",
+      "WHEN TO USE filter_documents INSTEAD: typed comparisons on custom fields (e.g. amount > 100), 'must have ALL these tags', 'has no correspondent', filtering by inbox/owner/mime, or any structured predicate the DSL can't express.",
+      "",
+      "QUERY DSL REFERENCE (all combinable, default operator is AND):",
+      "  Field searches:",
+      "    title:invoice          — search the title field",
+      "    content:bitcoin        — search OCR content",
+      "    type:invoice           — match document type by name",
+      "    correspondent:bank     — match correspondent by name",
+      "    tag:unpaid             — match tag by name (use multiple `tag:` for multiple tags)",
+      "    asn:1234               — archive serial number",
+      "    custom_fields.value:1312                 — match any custom field value",
+      '    custom_fields.name:"Contract Number"      — match a specific named custom field (quote multi-word names)',
+      "    custom_fields.name:Insurance custom_fields.value:policy   — combined: named field with specific value",
+      "    notes.user:alice       — note author username",
+      "    notes.note:reminder    — note content",
+      "  Date fields (created, added, modified):",
+      "    created:[2020 to 2024]                  — inclusive year range",
+      "    created:[2024-01-01 to 2024-06-30]       — date range",
+      "    added:yesterday                          — keyword",
+      "    modified:today                           — keyword",
+      '    modified:"this year"                     — multi-word keyword (quote it)',
+      '    Other keywords: today, yesterday, "previous week", "this month", "previous month", "this year", "previous year", "previous quarter"',
+      "    Note: custom date fields do NOT support relative date keywords — use filter_documents.custom_field_query with `range`/`gt`/`lt` for those.",
+      "  Boolean operators (case-sensitive):",
+      "    invoice AND unpaid",
+      "    (invoice OR receipt) AND correspondent:bank",
+      "    invoice NOT archived       (or use `-archived`)",
+      "  Patterns:",
+      "    prod*name              — `*` wildcard (zero or more chars)",
+      '    "exact phrase"        — quoted exact-phrase match',
+      "  Behavior notes:",
+      "    - Word order doesn't matter; matching is accent-insensitive (résumé == resume) and separator-agnostic (1312 finds A-1312/B).",
+      "    - Default scope: content, title, correspondent, type, tags, notes, custom field values.",
+      "    - Fuzzy matching is server-side configurable (PAPERLESS_ADVANCED_FUZZY_SEARCH_THRESHOLD).",
+      "",
+      "EXAMPLES:",
+      "  Unpaid invoices from 2024:                 type:invoice tag:unpaid created:[2024 to 2024]",
+      '  Bank docs with a specific contract number: correspondent:bank custom_fields.name:"Contract Number" custom_fields.value:1312',
+      '  Modified this week, noted by alice:        modified:"this week" notes.user:alice',
+      "  Either invoices or receipts, not archived: (type:invoice OR type:receipt) NOT tag:archived",
+    ].join("\n"),
     {
       query: z
         .string()
         .describe(
-          "Search query using Paperless-NGX syntax. By default, matches documents containing ALL words. Advanced syntax: Field searches: 'tag:unpaid', 'type:invoice', 'correspondent:university'. Logical operators: 'term1 AND (term2 OR term3)'. Date ranges: 'created:[2020 to 2024]', 'added:yesterday', 'modified:today'. Wildcards: 'prod*name'. Combine multiple criteria as needed. Search looks through document content, title, correspondent, type, and tags."
+          "Paperless-NGX query DSL string. See tool description for full operator reference. Examples: 'type:invoice tag:unpaid', 'correspondent:bank created:[2024 to 2024]', 'custom_fields.name:\"Contract Number\" custom_fields.value:1312', '(type:invoice OR type:receipt) NOT tag:archived'."
         ),
       page: z
         .number()
@@ -249,6 +294,180 @@ export function registerDocumentTools(server: McpServer, api: PaperlessAPI) {
     async (args) => {
       if (!api) throw new Error("Please configure API connection first");
       return asTextResult(await api.searchDocuments(args.query, args.page, args.page_size));
+    }
+  );
+
+  const customFieldQuerySchema: z.ZodType<unknown> = z.lazy(() =>
+    z.union([
+      z
+        .tuple([z.union([z.string(), z.number()]), z.string(), z.unknown()])
+        .describe("Atomic predicate: [fieldRefIdOrName, operator, value]"),
+      z
+        .tuple([z.enum(["AND", "OR"]), z.array(customFieldQuerySchema)])
+        .describe("Boolean group: ['AND'|'OR', [subqueries...]]"),
+      z.tuple([z.literal("NOT"), customFieldQuerySchema]).describe("Negation: ['NOT', subquery]"),
+    ])
+  );
+
+  server.tool(
+    "filter_documents",
+    [
+      "Structured filtering of documents — use this when search_documents' DSL is insufficient.",
+      "",
+      "WHEN TO USE (vs. search_documents):",
+      "  - Typed comparisons on custom fields: amount > 100, date in range, boolean true/false, 'is null', 'exists'.",
+      "  - Strict tag-set requirements: 'documents that have ALL of tags [1,2,3]' (DSL can't enforce 'all').",
+      "  - Negative filters: 'no correspondent', 'not in inbox', 'no tags assigned'.",
+      "  - Structural facets: by owner, mime_type, original_filename, archive_serial_number, has_custom_fields.",
+      "  - Date-bounded queries on standard fields with precise ISO dates.",
+      "",
+      "You may combine `query` (full-text DSL — same syntax as search_documents) with structured filters; results match BOTH.",
+      "",
+      "CUSTOM FIELD QUERY DSL (`custom_field_query` parameter):",
+      "  Call list_custom_fields FIRST to discover available custom fields, their IDs, and data_type.",
+      "  Shape — recursive, max depth 10, max 20 atoms total:",
+      "    Atom:    [fieldRef, operator, value]      where fieldRef is the custom field's id (number) or name (string)",
+      "    AND/OR:  ['AND', [subq1, subq2, ...]]      |  ['OR', [subq1, subq2, ...]]",
+      "    NOT:     ['NOT', subquery]",
+      "  Operators by field data_type:",
+      "    string / url / longtext: exact, in, isnull, exists, icontains, istartswith, iendswith",
+      "    integer / float:         exact, in, isnull, exists, gt, gte, lt, lte, range",
+      "    date:                    exact, in, isnull, exists, gt, gte, lt, lte, range, year__exact, month__exact, day__exact",
+      "    monetary:                exact, in, isnull, exists, icontains, istartswith, iendswith, gt, gte, lt, lte, range  (numeric compare strips currency)",
+      "    boolean:                 exact, in, isnull, exists  (value: true/false)",
+      "    select:                  exact, in, isnull, exists  (value: option id or label)",
+      "    documentlink:            exact, in, isnull, exists, contains  (contains: subset check on linked-document ids)",
+      "  Examples:",
+      "    Date range:    ['due', 'range', ['2024-08-01', '2024-09-01']]",
+      "    Numeric > :    ['Invoice Total', 'gt', 100]",
+      "    Boolean true:  ['answered', 'exact', true]",
+      "    Select in:     ['favorite animal', 'in', ['cat', 'dog']]",
+      "    Empty/null:    ['OR', [['address', 'isnull', true], ['address', 'exact', '']]]",
+      "    Field exists:  ['foo', 'exists', false]",
+      "    Doc link:      ['references', 'contains', [3, 7]]",
+      "    Combined:      ['AND', [['Invoice Total', 'gt', 100], ['status', 'exact', 'pending']]]",
+      "",
+      "STRUCTURED FILTERS reuse Django-ORM naming. Array params accept multiple ids and are comma-joined into the URL.",
+    ].join("\n"),
+    {
+      query: z
+        .string()
+        .optional()
+        .describe(
+          "Optional full-text query (same Paperless DSL as search_documents). Combined with structured filters via AND."
+        ),
+      correspondent__id__in: z
+        .array(z.number())
+        .optional()
+        .describe("Match documents whose correspondent is any of these IDs."),
+      correspondent__isnull: z
+        .boolean()
+        .optional()
+        .describe("True = documents with no correspondent assigned."),
+      document_type__id__in: z
+        .array(z.number())
+        .optional()
+        .describe("Match documents whose document type is any of these IDs."),
+      document_type__isnull: z
+        .boolean()
+        .optional()
+        .describe("True = documents with no document type assigned."),
+      storage_path__id__in: z
+        .array(z.number())
+        .optional()
+        .describe("Match documents stored at any of these storage path IDs."),
+      tags__id__all: z
+        .array(z.number())
+        .optional()
+        .describe("Documents must have ALL of these tag IDs (set intersection)."),
+      tags__id__in: z
+        .array(z.number())
+        .optional()
+        .describe("Documents have ANY of these tag IDs (set union)."),
+      tags__id__none: z
+        .array(z.number())
+        .optional()
+        .describe("Documents have NONE of these tag IDs (set exclusion)."),
+      is_tagged: z.boolean().optional().describe("True = has at least one tag; false = untagged."),
+      is_in_inbox: z
+        .boolean()
+        .optional()
+        .describe("True = currently in the inbox (has the inbox tag)."),
+      owner__id__in: z
+        .array(z.number())
+        .optional()
+        .describe("Match documents owned by any of these user IDs."),
+      owner__isnull: z.boolean().optional().describe("True = documents with no owner."),
+      title__icontains: z
+        .string()
+        .optional()
+        .describe("Case-insensitive substring match on title."),
+      content__icontains: z
+        .string()
+        .optional()
+        .describe(
+          "Case-insensitive substring match on OCR content. Slow on large corpora — prefer search_documents `query` for content search."
+        ),
+      original_filename__icontains: z
+        .string()
+        .optional()
+        .describe("Case-insensitive substring match on original uploaded filename."),
+      archive_serial_number: z.string().optional().describe("Exact archive serial number match."),
+      mime_type: z
+        .string()
+        .optional()
+        .describe("Filter by MIME type (e.g. 'application/pdf', 'image/png')."),
+      created__gte: z
+        .string()
+        .optional()
+        .describe("Created on or after this date (ISO YYYY-MM-DD or full ISO datetime)."),
+      created__lte: z
+        .string()
+        .optional()
+        .describe("Created on or before this date (ISO YYYY-MM-DD or full ISO datetime)."),
+      added__gte: z
+        .string()
+        .optional()
+        .describe("Added to Paperless on or after this date (ISO format)."),
+      added__lte: z
+        .string()
+        .optional()
+        .describe("Added to Paperless on or before this date (ISO format)."),
+      modified__gte: z
+        .string()
+        .optional()
+        .describe("Last modified on or after this date (ISO format)."),
+      modified__lte: z
+        .string()
+        .optional()
+        .describe("Last modified on or before this date (ISO format)."),
+      has_custom_fields: z
+        .boolean()
+        .optional()
+        .describe("True = has at least one custom field assigned."),
+      custom_fields__id__all: z
+        .array(z.number())
+        .optional()
+        .describe(
+          "Documents must have ALL these custom field IDs assigned (existence, not value — use custom_field_query for value predicates)."
+        ),
+      custom_field_query: customFieldQuerySchema
+        .optional()
+        .describe(
+          "Typed predicate tree on custom field VALUES. See tool description for full operator/shape reference. Call list_custom_fields first to learn field names/types/select options. Example: ['AND', [['Invoice Total', 'gt', 100], ['status', 'exact', 'pending']]]."
+        ),
+      ordering: z
+        .string()
+        .optional()
+        .describe(
+          "Sort field. Prefix with '-' for descending. Common: 'created', '-created', 'title', '-modified', 'archive_serial_number'."
+        ),
+      page: z.number().optional().describe("Pagination page (1-based)."),
+      page_size: z.number().optional().describe("Items per page (default 25, max 100)."),
+    },
+    async (args) => {
+      if (!api) throw new Error("Please configure API connection first");
+      return asTextResult(await api.filterDocuments(args));
     }
   );
 

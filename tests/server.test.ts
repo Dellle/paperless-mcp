@@ -27,8 +27,10 @@ describe("MCP server registration", () => {
         "create_tag",
         "delete_tag",
         "download_document",
+        "filter_documents",
         "get_document",
         "list_correspondents",
+        "list_custom_fields",
         "list_document_types",
         "list_tags",
         "post_document",
@@ -38,14 +40,14 @@ describe("MCP server registration", () => {
     );
   });
 
-  it("attaches version-5 Accept header and Token auth", async () => {
+  it("attaches version-10 Accept header and Token auth", async () => {
     h.setNextResponse({ count: 0, results: [] });
     await h.client.callTool({ name: "list_tags", arguments: {} });
 
     expect(h.calls).toHaveLength(1);
     const headers = h.calls[0]?.init.headers as Record<string, string>;
     expect(headers.Authorization).toBe(`Token ${TEST_TOKEN}`);
-    expect(headers.Accept).toBe("application/json; version=5");
+    expect(headers.Accept).toBe("application/json; version=10");
   });
 
   it("rejects invalid arguments via zod schema", async () => {
@@ -276,5 +278,155 @@ describe("document types tools", () => {
     });
     const body = JSON.parse(h.calls[0]?.init.body as string);
     expect(body.object_type).toBe("document_types");
+  });
+});
+
+describe("filter_documents tool", () => {
+  let h: FetchHarness;
+  beforeEach(async () => {
+    h = await setupHarness();
+  });
+  afterEach(async () => {
+    await h.cleanup();
+  });
+
+  it("hits /documents/ with no params when called empty", async () => {
+    h.setNextResponse({ count: 0, results: [] });
+    await h.client.callTool({ name: "filter_documents", arguments: {} });
+    expect(h.calls[0]?.url).toBe("https://paperless.test/api/documents/");
+  });
+
+  it("emits array filter params as comma-joined values", async () => {
+    h.setNextResponse({ count: 0, results: [] });
+    await h.client.callTool({
+      name: "filter_documents",
+      arguments: {
+        tags__id__all: [1, 2, 3],
+        correspondent__id__in: [7],
+      },
+    });
+    const url = new URL(h.calls[0]?.url as string);
+    expect(url.searchParams.get("tags__id__all")).toBe("1,2,3");
+    expect(url.searchParams.get("correspondent__id__in")).toBe("7");
+  });
+
+  it("stringifies booleans and forwards scalars", async () => {
+    h.setNextResponse({ count: 0, results: [] });
+    await h.client.callTool({
+      name: "filter_documents",
+      arguments: {
+        is_in_inbox: true,
+        has_custom_fields: false,
+        title__icontains: "invoice",
+        created__gte: "2024-01-01",
+        ordering: "-created",
+        page: 2,
+        page_size: 10,
+      },
+    });
+    const url = new URL(h.calls[0]?.url as string);
+    expect(url.searchParams.get("is_in_inbox")).toBe("true");
+    expect(url.searchParams.get("has_custom_fields")).toBe("false");
+    expect(url.searchParams.get("title__icontains")).toBe("invoice");
+    expect(url.searchParams.get("created__gte")).toBe("2024-01-01");
+    expect(url.searchParams.get("ordering")).toBe("-created");
+    expect(url.searchParams.get("page")).toBe("2");
+    expect(url.searchParams.get("page_size")).toBe("10");
+  });
+
+  it("JSON-encodes custom_field_query and forwards verbatim", async () => {
+    h.setNextResponse({ count: 0, results: [] });
+    const cfq = [
+      "AND",
+      [
+        ["Invoice Total", "gt", 100],
+        ["status", "exact", "pending"],
+      ],
+    ];
+    await h.client.callTool({
+      name: "filter_documents",
+      arguments: { custom_field_query: cfq },
+    });
+    const url = new URL(h.calls[0]?.url as string);
+    expect(JSON.parse(url.searchParams.get("custom_field_query") as string)).toEqual(cfq);
+  });
+
+  it("strips content/download_url/thumbnail_url from results", async () => {
+    h.setNextResponse({
+      count: 1,
+      results: [
+        {
+          id: 9,
+          title: "Receipt",
+          content: "long ocr".repeat(500),
+          download_url: "https://x/y",
+          thumbnail_url: "https://x/t",
+          tags: [1],
+        },
+      ],
+    });
+    const result = await h.client.callTool({
+      name: "filter_documents",
+      arguments: { tags__id__all: [1] },
+    });
+    const body = parseJson(result as never) as { results: Array<Record<string, unknown>> };
+    const first = body.results[0];
+    expect(first?.content).toBeUndefined();
+    expect(first?.download_url).toBeUndefined();
+    expect(first?.thumbnail_url).toBeUndefined();
+    expect(first?.id).toBe(9);
+  });
+
+  it("rejects malformed custom_field_query shape via zod", async () => {
+    await expect(
+      h.client.callTool({
+        name: "filter_documents",
+        arguments: { custom_field_query: { not: "an array" } },
+      })
+    ).rejects.toThrow(/Invalid arguments/);
+  });
+
+  it("accepts nested AND/OR/NOT trees", async () => {
+    h.setNextResponse({ count: 0, results: [] });
+    const cfq = [
+      "OR",
+      [
+        ["NOT", ["archived", "exact", true]],
+        [
+          "AND",
+          [
+            ["due", "range", ["2024-01-01", "2024-12-31"]],
+            ["amount", "gte", 50],
+          ],
+        ],
+      ],
+    ];
+    await h.client.callTool({
+      name: "filter_documents",
+      arguments: { custom_field_query: cfq },
+    });
+    const url = new URL(h.calls[0]?.url as string);
+    expect(JSON.parse(url.searchParams.get("custom_field_query") as string)).toEqual(cfq);
+  });
+});
+
+describe("custom fields tool", () => {
+  let h: FetchHarness;
+  beforeEach(async () => {
+    h = await setupHarness();
+  });
+  afterEach(async () => {
+    await h.cleanup();
+  });
+
+  it("list_custom_fields hits /custom_fields/", async () => {
+    h.setNextResponse({
+      count: 1,
+      results: [{ id: 1, name: "Invoice Total", data_type: "monetary", extra_data: {} }],
+    });
+    const result = await h.client.callTool({ name: "list_custom_fields", arguments: {} });
+    expect(h.calls[0]?.url).toBe("https://paperless.test/api/custom_fields/");
+    const body = parseJson(result as never) as { results: Array<Record<string, unknown>> };
+    expect(body.results[0]?.name).toBe("Invoice Total");
   });
 });
